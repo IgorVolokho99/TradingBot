@@ -1,15 +1,14 @@
-from pprint import pprint
 from sqlalchemy.orm import sessionmaker, scoped_session
-
+from sqlalchemy.exc import IntegrityError
 import ccxt
 import pandas as pd
-import pytz
 import time
-
+from datetime import datetime, timedelta
 from src.database.models import BtcUsdt, engine
 
 
 def prepare_df(df: pd.DataFrame):
+    """Подготовка данных перед вставкой в базу."""
     df['utc_time'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['msc_time'] = pd.to_datetime(df['timestamp'] + 3600000 * 3, unit='ms')
     df['timestamp'] = df['timestamp'].astype(str)
@@ -23,45 +22,61 @@ def prepare_df(df: pd.DataFrame):
     return df
 
 
-def fetch_historical_data(symbol, timeframe, since, save_file=None):
+def fetch_historical_data(symbol, timeframe, start_date):
+    """Загрузка данных начиная с указанной даты."""
     exchange = ccxt.binance()
-    all_data = []
     limit = 1000
-    print(f"Начало загрузки данных для {symbol} с {pd.to_datetime(since, unit='ms')}...")
+    start_time = exchange.parse8601(start_date)  # Начальная дата
+    end_time = exchange.milliseconds()  # Текущая дата
 
-    while since < exchange.milliseconds():
+    print(f"Начало загрузки данных для {symbol} с {pd.to_datetime(start_time, unit='ms')}...")
+
+    session_factory = sessionmaker(engine)
+    session = scoped_session(session_factory)
+
+    while start_time < end_time:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=limit)
+            # Тут ограничение
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=start_time, limit=limit)
             if not ohlcv:
+                print("Данные закончились.")
                 break
-            session_factory = sessionmaker(engine)
-            session = scoped_session(session_factory)
-            all_data.extend(ohlcv)
+
             df = pd.DataFrame(ohlcv,
                               columns=['timestamp', 'open_price', 'high_price', 'low_price', 'close_price', 'volume'])
-
             df = prepare_df(df)
 
-            since = ohlcv[-1][0] + 1
+            # Инсертим в базу
             for i in range(len(df)):
-                obj = BtcUsdt(**(df.iloc[i].to_dict()))
-                session.add(obj)
-                session.commit()
+                obj_data = df.iloc[i].to_dict()
+                try:
+                    obj = BtcUsdt(**obj_data)
+                    session.add(obj)
+                except IntegrityError:
+                    session.rollback()  # Может дублирование, по тупом присылает
+                    print(f"Дубликат записи: {obj_data['msc_time']}")
 
-            print(f"Загружено {len(all_data)} строк, текущая дата: {pd.to_datetime(since, unit='ms')}")
-            pprint(all_data)
-            time.sleep(0.5)
+            session.commit()
+            start_time = ohlcv[-1][0] + 1
+
+            print(f"Загружено {len(ohlcv)} строк, текущая дата: {pd.to_datetime(start_time, unit='ms')}")
+            time.sleep(0.5)  # Пауза из-за API
         except Exception as e:
+            session.rollback()
             print(f"Ошибка: {e}")
             break
 
+    session.close()
+    print("Загрузка завершена.")
 
-symbol = 'BTC/USDT'
-timeframe = '1h'
-start_date = '2017-09-01T00:00:00Z'
-start_time = ccxt.Exchange().parse8601(start_date)
-save_path = 'btc_usdt_hourly_with_timezones.csv'
 
-data = fetch_historical_data(symbol, timeframe, start_time, save_file=save_path)
+def main():
+    symbol = 'BTC/USDT'
+    timeframe = '1h'
+    start_date = '2017-09-01T00:00:00Z'
 
-print(data.head())
+    fetch_historical_data(symbol, timeframe, start_date)
+
+
+if __name__ == "__main__":
+    main()
